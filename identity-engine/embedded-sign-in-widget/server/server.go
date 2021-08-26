@@ -19,9 +19,7 @@ package server
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -62,6 +60,10 @@ type PKCE struct {
 	CodeChallengeMethod string
 }
 
+func (p *PKCE) String() string {
+	return fmt.Sprintf("{CodeVerifier: %s, CodeChallenge: %s, CodeChallengeMethod: %s}", p.CodeVerifier, p.CodeChallenge, p.CodeChallengeMethod)
+}
+
 type Server struct {
 	config            *config.Config
 	idxClient         *idx.Client
@@ -72,7 +74,6 @@ type Server struct {
 	svc               *http.Server
 	address           string
 	pkce              *PKCE
-	state             string
 	interactionHandle string
 }
 
@@ -98,7 +99,6 @@ func NewServer(c *config.Config) *Server {
 			"Authenticated": false,
 			"Errors":        "",
 		},
-		state: hex.EncodeToString(b),
 	}
 }
 
@@ -155,67 +155,63 @@ func (s *Server) HomeHandler(w http.ResponseWriter, r *http.Request) {
 	s.tpl.ExecuteTemplate(w, "home.gohtml", data)
 }
 
+type LoginData struct {
+	IsAuthenticated   bool
+	BaseUrl           string
+	ClientId          string
+	Issuer            string
+	State             string
+	Nonce             string
+	InteractionHandle string
+	Pkce              *PKCE
+}
+
 func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Cache-Control", "no-cache") // See https://github.com/okta/samples-golang/issues/20
+	idxContext, err := s.idxClient.Interact(r.Context())
+	if err != nil {
+		fmt.Printf("error: %s\n", err.Error())
+		os.Exit(1)
+	}
+	s.pkce = &PKCE{
+		CodeVerifier:        idxContext.CodeVerifier,
+		CodeChallenge:       idxContext.CodeChallenge,
+		CodeChallengeMethod: idxContext.CodeChallengeMethod,
+	}
 
 	session, err := s.sessionStore.Get(r, SESSION_STORE_NAME)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	if session.Values["pkceData"] == nil || session.Values["pkceData"] == "" {
-		s.pkce, err = createPKCEData()
-		if err != nil {
-			fmt.Printf("could not create pkce data: %s\n", err.Error())
-			os.Exit(1)
-		}
-		session.Values["pkce_code_verifier"] = s.pkce.CodeVerifier
-		session.Values["pkce_code_challenge"] = s.pkce.CodeChallenge
-		session.Values["pkce_code_challenge_method"] = s.pkce.CodeChallengeMethod
-		session.Save(r, w)
-	} else {
-		s.pkce.CodeVerifier = session.Values["pkce_code_verifier"].(string)
-		s.pkce.CodeChallenge = session.Values["pkce_code_challenge"].(string)
-		s.pkce.CodeChallengeMethod = session.Values["pkce_code_challenge_method"].(string)
-	}
+	session.Values["pkce_code_verifier"] = s.pkce.CodeVerifier
+	session.Values["pkce_code_challenge"] = s.pkce.CodeChallenge
+	session.Values["pkce_code_challenge_method"] = s.pkce.CodeChallengeMethod
+	session.Values["state"] = idxContext.State
+	session.Values["interaction_handle"] = idxContext.InteractionHandle.InteractionHandle
+	session.Save(r, w)
+
 	nonce, err := generateNonce()
 	if err != nil {
 		fmt.Printf("error: %s\n", err.Error())
 		os.Exit(1)
 	}
-	type customData struct {
-		IsAuthenticated   bool
-		BaseUrl           string
-		ClientId          string
-		Issuer            string
-		State             string
-		Nonce             string
-		InteractionHandle string
-		Pkce              *PKCE
-	}
 
-	interactionHandle, err := s.getInteractionHandle(s.pkce.CodeChallenge)
-	s.interactionHandle = interactionHandle
-	if err != nil {
-		fmt.Printf("could not get interactionHandle: %s\n", err.Error())
-	}
-
-	issuerURL := s.idxClient.Config().Okta.IDX.Issuer
-	issuerParts, err := url.Parse(issuerURL)
+	issuer := s.idxClient.Config().Okta.IDX.Issuer
+	issuerURL, err := url.Parse(issuer)
 	if err != nil {
 		fmt.Printf("error: %s\n", err.Error())
 		os.Exit(1)
 	}
-	baseUrl := issuerParts.Scheme + "://" + issuerParts.Hostname()
+	baseUrl := issuerURL.Scheme + "://" + issuerURL.Hostname()
 
-	data := customData{
+	data := LoginData{
 		IsAuthenticated:   s.isAuthenticated(r),
 		BaseUrl:           baseUrl,
 		ClientId:          s.idxClient.Config().Okta.IDX.ClientID,
 		Issuer:            s.idxClient.Config().Okta.IDX.Issuer,
-		State:             s.state,
+		State:             idxContext.State,
 		Nonce:             nonce,
 		Pkce:              s.pkce,
-		InteractionHandle: interactionHandle,
+		InteractionHandle: string(idxContext.InteractionHandle.InteractionHandle),
 	}
 	err = s.tpl.ExecuteTemplate(w, "login.gohtml", data)
 	if err != nil {
@@ -225,47 +221,21 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) LoginCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Check the state that was returned in the query string is the same as the above state
-	if r.URL.Query().Get("state") != s.state {
-		fmt.Fprintln(w, "The state was not as expected")
+	session, err := s.sessionStore.Get(r, SESSION_STORE_NAME)
+	if err != nil {
+		fmt.Printf("error: %s\n", err.Error())
+		os.Exit(1)
+	}
+	state := session.Values["state"].(string)
+	if r.URL.Query().Get("state") != state {
+		fmt.Fprintf(w, "The state was not as expected, received %q, our saved state %q)", r.URL.Query().Get("state"), state)
 		return
 	}
 
 	// Check if interaction_required error is returned
 	if r.URL.Query().Get("error") == "interaction_required" {
 		w.Header().Add("Cache-Control", "no-cache")
-
-		// render the widget with the saved interaction handle
-		type customData struct {
-			IsAuthenticated   bool
-			BaseUrl           string
-			ClientId          string
-			Issuer            string
-			State             string
-			InteractionHandle string
-			Pkce              *PKCE
-		}
-
-		issuerURL := s.idxClient.Config().Okta.IDX.Issuer
-		issuerParts, err := url.Parse(issuerURL)
-		if err != nil {
-			fmt.Printf("error: %s\n", err.Error())
-			os.Exit(1)
-		}
-		baseUrl := issuerParts.Scheme + "://" + issuerParts.Hostname()
-
-		data := customData{
-			IsAuthenticated:   s.isAuthenticated(r),
-			BaseUrl:           baseUrl,
-			ClientId:          s.idxClient.Config().Okta.IDX.ClientID,
-			Issuer:            s.idxClient.Config().Okta.IDX.Issuer,
-			State:             s.state,
-			Pkce:              s.pkce,
-			InteractionHandle: s.interactionHandle,
-		}
-		err = s.tpl.ExecuteTemplate(w, "login.gohtml", data)
-		if err != nil {
-			fmt.Printf("error: %s\n", err.Error())
-		}
+		s.LoginHandler(w, r)
 		return
 	}
 
@@ -275,7 +245,7 @@ func (s *Server) LoginCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := s.sessionStore.Get(r, SESSION_STORE_NAME)
+	//session, err := s.sessionStore.Get(r, SESSION_STORE_NAME)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -375,7 +345,7 @@ func (s *Server) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("DEBUG") == "true" || !s.config.Testing {
+		if os.Getenv("LOGGING") == "true" || !s.config.Testing {
 			log.Printf("%s: %s\n", r.Method, r.RequestURI)
 		}
 		next.ServeHTTP(w, r)
@@ -443,43 +413,6 @@ func (s *Server) isAuthenticated(r *http.Request) bool {
 	return true
 }
 
-// Creates a codeVerifier that is used for PKCE
-func createCodeVerifier() (*string, error) {
-	codeVerifier := make([]byte, 86)
-	_, err := rand.Read(codeVerifier)
-	if err != nil {
-		return nil, fmt.Errorf("error creating code_verifier: %w", err)
-	}
-
-	s := base64.RawURLEncoding.EncodeToString(codeVerifier)
-	return &s, nil
-}
-
-// Create the PKCE data for the authentication flow.
-// This data will be used when getting an interaction
-// handle as well as when you exchange your tokens.
-func createPKCEData() (*PKCE, error) {
-	h := sha256.New()
-
-	codeVerifier, err := createCodeVerifier()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create codeVerifier: %w", err)
-	}
-
-	_, err = h.Write([]byte(*codeVerifier))
-	if err != nil {
-		return nil, fmt.Errorf("failed to write codeVerifier: %w", err)
-	}
-
-	codeChallenge := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-
-	return &PKCE{
-		CodeChallenge:       codeChallenge,
-		CodeVerifier:        *codeVerifier,
-		CodeChallengeMethod: "S256",
-	}, nil
-}
-
 // Generate a Nonce to be used during the initialization of the SIW
 func generateNonce() (string, error) {
 	nonceBytes := make([]byte, 32)
@@ -489,45 +422,6 @@ func generateNonce() (string, error) {
 	}
 
 	return base64.URLEncoding.EncodeToString(nonceBytes), nil
-}
-
-// Get the interaction handle to begin the flow. Use this
-// value when initializing the Okta sign in widget.
-func (s *Server) getInteractionHandle(codeChallenge string) (string, error) {
-
-	data := url.Values{}
-	data.Set("scope", strings.Join(s.idxClient.Config().Okta.IDX.Scopes, " "))
-	data.Set("code_challenge", codeChallenge)
-	data.Set("code_challenge_method", "S256")
-	data.Set("redirect_uri", s.idxClient.Config().Okta.IDX.RedirectURI)
-	data.Set("state", s.state)
-
-	endpoint := s.oAuthEndPoint("interact")
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", fmt.Errorf("failed to create interact http request: %w", err)
-	}
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{Timeout: time.Second * 30}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http call has failed: %w", err)
-	}
-	type interactionHandleResponse struct {
-		InteractionHandle string `json:"interaction_handle"`
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("READ ERROR: %+v\n", err.Error())
-	}
-	defer resp.Body.Close()
-	var interactionHandle interactionHandleResponse
-	err = json.Unmarshal(body, &interactionHandle)
-	if err != nil {
-		return "", err
-	}
-
-	return interactionHandle.InteractionHandle, nil
 }
 
 func (s *Server) oAuthEndPoint(operation string) string {
